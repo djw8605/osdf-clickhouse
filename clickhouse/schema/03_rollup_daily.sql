@@ -1,5 +1,7 @@
--- Daily rollup: same aggregate columns as the hourly rollup, bucketed by day.
--- Cheaper to scan for long time ranges (dashboards over months/years).
+-- Daily rollup: same aggregate columns and dimensions as the hourly rollup,
+-- bucketed by day. Cheaper to scan for long time ranges (months/years).
+-- dirname1/dirname2 provide directory-level accounting; the full filename is
+-- NOT a dimension (only the uniqState sketch references it).
 CREATE TABLE IF NOT EXISTS xrootd.rollup_daily_local ON CLUSTER '{cluster}'
 (
     day             Date,
@@ -7,6 +9,8 @@ CREATE TABLE IF NOT EXISTS xrootd.rollup_daily_local ON CLUSTER '{cluster}'
     vo              LowCardinality(String),
     source_exchange LowCardinality(String),
     operation       LowCardinality(String),
+    dirname1        String,
+    dirname2        String,
     events          AggregateFunction(count),
     bytes_read      AggregateFunction(sum, UInt64),
     bytes_written   AggregateFunction(sum, UInt64),
@@ -17,7 +21,7 @@ ENGINE = ReplicatedAggregatingMergeTree(
     '{replica}'
 )
 PARTITION BY toYYYYMM(day)
-ORDER BY (day, server_hostname, vo, source_exchange, operation)
+ORDER BY (day, server_hostname, vo, source_exchange, operation, dirname1, dirname2)
 TTL day + INTERVAL 2 YEAR DELETE;
 
 CREATE TABLE IF NOT EXISTS xrootd.rollup_daily_dist ON CLUSTER '{cluster}'
@@ -33,9 +37,11 @@ SELECT
     vo,
     source_exchange,
     if(write > 0, 'write', 'read') AS operation,
+    dirname1,
+    dirname2,
     countState()                   AS events,
     sumState(read)                 AS bytes_read,
     sumState(write)                AS bytes_written,
     uniqState(filename)            AS uniq_files
 FROM xrootd.raw_records_local
-GROUP BY day, server_hostname, vo, source_exchange, operation;
+GROUP BY day, server_hostname, vo, source_exchange, operation, dirname1, dirname2;

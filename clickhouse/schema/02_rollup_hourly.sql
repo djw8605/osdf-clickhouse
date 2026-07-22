@@ -6,7 +6,11 @@
 -- and shards, so the same rollup answers "events per hour", "bytes per host",
 -- "unique files per VO" cheaply and exactly.
 --
--- Dimensions: hour, server host, VO, stream type (source_exchange), operation.
+-- Dimensions: hour, server host, VO, stream type (source_exchange), operation,
+-- and the top directory levels (dirname1, dirname2) for directory-level
+-- accounting. The full filename is deliberately NOT a dimension -- it appears
+-- only inside uniqState(filename), a distinct-count sketch from which no path
+-- can be recovered.
 -- `operation` is derived: any record that wrote bytes is a 'write', else 'read'.
 CREATE TABLE IF NOT EXISTS xrootd.rollup_hourly_local ON CLUSTER '{cluster}'
 (
@@ -15,6 +19,8 @@ CREATE TABLE IF NOT EXISTS xrootd.rollup_hourly_local ON CLUSTER '{cluster}'
     vo              LowCardinality(String),
     source_exchange LowCardinality(String),
     operation       LowCardinality(String),
+    dirname1        String,
+    dirname2        String,
     events          AggregateFunction(count),
     bytes_read      AggregateFunction(sum, UInt64),
     bytes_written   AggregateFunction(sum, UInt64),
@@ -25,7 +31,7 @@ ENGINE = ReplicatedAggregatingMergeTree(
     '{replica}'
 )
 PARTITION BY toYYYYMM(hour)
-ORDER BY (hour, server_hostname, vo, source_exchange, operation)
+ORDER BY (hour, server_hostname, vo, source_exchange, operation, dirname1, dirname2)
 TTL hour + INTERVAL 2 YEAR DELETE;
 
 -- Distributed front for cluster-wide reads (re-merges states across shards).
@@ -46,9 +52,11 @@ SELECT
     vo,
     source_exchange,
     if(write > 0, 'write', 'read') AS operation,
+    dirname1,
+    dirname2,
     countState()                   AS events,
     sumState(read)                 AS bytes_read,
     sumState(write)                AS bytes_written,
     uniqState(filename)            AS uniq_files
 FROM xrootd.raw_records_local
-GROUP BY hour, server_hostname, vo, source_exchange, operation;
+GROUP BY hour, server_hostname, vo, source_exchange, operation, dirname1, dirname2;

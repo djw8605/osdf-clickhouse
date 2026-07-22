@@ -49,6 +49,20 @@ WHERE day = today() - 1
 GROUP BY source_exchange, operation
 ORDER BY events DESC;
 
+-- 4b) Directory-level accounting: top directories by bytes read in the last
+--     7 days, using the dirname1/dirname2 dimensions (no filename exposed).
+SELECT
+    dirname1,
+    dirname2,
+    sumMerge(bytes_read)  AS bytes_read,
+    countMerge(events)    AS events,
+    uniqMerge(uniq_files) AS unique_files
+FROM xrootd.rollup_daily_dist
+WHERE day >= today() - 7
+GROUP BY dirname1, dirname2
+ORDER BY bytes_read DESC
+LIMIT 50;
+
 -- 5) Raw-table spot check (use FINAL to force dedup at read time on small
 --    ranges only -- FINAL is expensive; prefer the rollups for aggregates).
 SELECT
