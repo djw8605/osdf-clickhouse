@@ -1,0 +1,21 @@
+# Secrets — never commit real credentials.
+**/secret.yaml
+clickhouse/secret.yaml
+deploy/ingester/secret.yaml
+
+# Go build artifacts
+ingester/ingester
+ingester/bin/
+*.test
+*.out
+coverage.txt
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Local scratch
+/tmp/
+scratch/

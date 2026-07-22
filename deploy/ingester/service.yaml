@@ -1,0 +1,17 @@
+# Headless service exposing the ingester metrics/health port for the
+# ServiceMonitor to discover all pods.
+apiVersion: v1
+kind: Service
+metadata:
+  name: osdf-clickhouse-ingester
+  labels:
+    app.kubernetes.io/name: osdf-clickhouse-ingester
+    app.kubernetes.io/part-of: osdf-clickhouse
+spec:
+  clusterIP: None            # headless: one endpoint per pod
+  selector:
+    app.kubernetes.io/name: osdf-clickhouse-ingester
+  ports:
+    - name: metrics
+      port: 9100
+      targetPort: metrics

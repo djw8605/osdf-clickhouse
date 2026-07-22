@@ -1,0 +1,83 @@
+# ClickHouse Keeper — 3-node quorum for ReplicatedMergeTree coordination.
+#
+# ReplicatedReplacingMergeTree / ReplicatedAggregatingMergeTree require a
+# ZooKeeper-protocol coordination service; ClickHouse Keeper is the native,
+# recommended implementation. Three nodes give a quorum that tolerates one
+# failure.
+#
+# Managed by the Altinity operator's ClickHouseKeeperInstallation (CHK) CRD.
+#
+# PER-CLUSTER VALUES TO SET:
+#   * storageClassName  -> an RWO block storage class (see README). REQUIRED on NRP/Nautilus.
+#   * apply into the SAME namespace as the CHI and ingester.
+#
+apiVersion: "clickhouse-keeper.altinity.com/v1"
+kind: "ClickHouseKeeperInstallation"
+metadata:
+  name: clickhouse-keeper
+  labels:
+    app.kubernetes.io/part-of: osdf-clickhouse
+spec:
+  configuration:
+    clusters:
+      - name: keeper
+        layout:
+          # 3-node quorum. Keep this ODD (3, 5, ...) so a majority always exists.
+          replicasCount: 3
+    settings:
+      logger/level: information
+      # Snapshot/log retention tuning for a busy cluster.
+      keeper_server/coordination_settings/raft_logs_level: information
+      keeper_server/storage_path: /var/lib/clickhouse-keeper
+  templates:
+    podTemplates:
+      - name: keeper-pod
+        spec:
+          # Multi-tenant hardening (Part A requirements).
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 101
+            runAsGroup: 101
+            fsGroup: 101
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: clickhouse-keeper
+              # PINNED. Keep in the same 24.8 LTS family as the server image.
+              image: clickhouse/clickhouse-keeper:24.8
+              imagePullPolicy: IfNotPresent
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: false
+                runAsNonRoot: true
+                capabilities:
+                  drop:
+                    - ALL
+              resources:
+                requests:
+                  cpu: "500m"
+                  memory: "512Mi"
+                limits:
+                  cpu: "1"
+                  memory: "1Gi"
+          # Spread the 3 Keeper pods across nodes for fault tolerance.
+          affinity:
+            podAntiAffinity:
+              preferredDuringSchedulingIgnoredDuringExecution:
+                - weight: 100
+                  podAffinityTerm:
+                    labelSelector:
+                      matchLabels:
+                        app: clickhouse-keeper
+                    topologyKey: kubernetes.io/hostname
+    volumeClaimTemplates:
+      - name: keeper-data
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          # >>> SET PER CLUSTER <<< e.g. "rook-ceph-block" on NRP/Nautilus.
+          # storageClassName: "REPLACE_ME_BLOCK_STORAGE_CLASS"
+          resources:
+            requests:
+              # Keeper state is small (logs + snapshots); 10Gi is generous.
+              storage: 10Gi

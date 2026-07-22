@@ -1,0 +1,7 @@
+# Keep the build context minimal.
+Dockerfile
+.dockerignore
+*_test.go
+test/
+**/*_test.go
+README.md

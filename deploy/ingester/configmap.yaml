@@ -1,0 +1,49 @@
+# Non-secret ingester configuration (12-factor env vars).
+# Secrets (AMQP credentials / JWT token, ClickHouse password) live in the
+# Secret, NOT here. See secret.example.yaml.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ingester-config
+  labels:
+    app.kubernetes.io/name: osdf-clickhouse-ingester
+    app.kubernetes.io/part-of: osdf-clickhouse
+data:
+  # --- RabbitMQ ---
+  # Host only; credentials are injected differently depending on auth mode:
+  #   * token mode: URL has NO userinfo; INGESTER_AMQP_TOKEN_FILE points at the
+  #     mounted JWT (username "shoveler"). See the Deployment volume mount.
+  #   * plain mode: put user:pass in INGESTER_AMQP_URL via the Secret instead.
+  # >>> SET the broker host/vhost per cluster <<<
+  INGESTER_AMQP_URL: "amqps://osg-broker.example.org:5671/%2f"
+  INGESTER_AMQP_TOKEN_FILE: "/etc/ingester/amqp-token/token"
+
+  # Non-WLCG exchanges (defaults; WLCG exchanges intentionally excluded).
+  INGESTER_EXCHANGES: "shoveled-xrd,xrd-cache-events,xrd-tcp-events,xrd-tpc-events"
+  # Assumed exchange type (see README "Exchange type assumption"). Passive
+  # declare avoids ever redeclaring with a conflicting type.
+  INGESTER_EXCHANGE_TYPE: "fanout"
+  INGESTER_EXCHANGE_PASSIVE: "true"
+  INGESTER_BIND_KEY: ""            # "" for fanout/direct; "#" for a topic exchange
+  INGESTER_QUEUE_PREFIX: "osdf-clickhouse-ingester"
+  INGESTER_PREFETCH: "2000"
+  # Optional dead-letter exchange; empty -> failed batches are nack-requeued.
+  INGESTER_DEAD_LETTER_EXCHANGE: ""
+
+  # --- ClickHouse ---
+  # Insert through the Distributed table on the internal cluster service.
+  INGESTER_CH_ADDRS: "clickhouse-xrootd:9000"
+  INGESTER_CH_DATABASE: "xrootd"
+  INGESTER_CH_TABLE: "raw_records_dist"
+  INGESTER_CH_USERNAME: "ingester"
+  INGESTER_CH_PASSWORD_FILE: "/etc/ingester/ch/password"
+  INGESTER_CH_SECURE: "false"
+
+  # --- Batching ---
+  INGESTER_BATCH_SIZE: "10000"
+  INGESTER_FLUSH_INTERVAL: "1s"
+
+  # --- Observability ---
+  INGESTER_METRICS_ADDR: ":9100"
+  INGESTER_LOG_LEVEL: "info"
+  INGESTER_LOG_FORMAT: "json"

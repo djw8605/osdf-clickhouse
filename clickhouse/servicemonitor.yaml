@@ -1,0 +1,32 @@
+# Prometheus ServiceMonitor scraping ClickHouse's built-in /metrics endpoint
+# (enabled via prometheus/* settings in clickhouse-installation.yaml, port 9363).
+#
+# Requires the Prometheus Operator CRDs (present on NRP/Nautilus). If your
+# Prometheus uses a release label selector (common with kube-prometheus-stack),
+# add it under metadata.labels (e.g. release: prometheus).
+#
+# NOTE: this scrapes the ClickHouse server metrics directly. The Altinity
+# operator ALSO exposes a metrics-exporter (query-level ClickHouse metrics) at
+# the operator service on :8888; add a second ServiceMonitor for it if you want
+# those. See operator/README.md.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: clickhouse-xrootd
+  labels:
+    app.kubernetes.io/part-of: osdf-clickhouse
+    # >>> If your Prometheus selects by release label, set it here <<<
+    # release: prometheus
+spec:
+  namespaceSelector:
+    # Restrict to the namespace this monitor is deployed in.
+    matchLabels: {}
+  selector:
+    matchLabels:
+      # Operator-applied label identifying services belonging to this CHI.
+      clickhouse.altinity.com/chi: xrootd
+  endpoints:
+    - port: metrics        # the named 9363 port added to the CHI serviceTemplate
+      path: /metrics
+      interval: 30s
+      scheme: http

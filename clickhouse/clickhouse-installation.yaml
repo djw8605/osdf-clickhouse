@@ -1,0 +1,195 @@
+# ClickHouseInstallation (CHI) — sharded + replicated ClickHouse cluster.
+#
+# Default topology: 2 shards × 2 replicas = 4 ClickHouse pods.
+#   * Shards split the data (horizontal scale of writes + storage).
+#   * Replicas copy each shard (HA + read scale). ReplicatedMergeTree keeps
+#     replicas in sync via ClickHouse Keeper (keeper.yaml).
+#
+# TO CHANGE THE TOPOLOGY: edit shardsCount / replicasCount below and re-apply.
+# The operator reconciles the StatefulSets. Adding a shard requires reshuffling
+# data for even distribution (see README "Runbook: scale shards/replicas").
+#
+# PER-CLUSTER VALUES TO SET (search "REPLACE" / ">>>"):
+#   * storageClassName  -> RWO block storage class (REQUIRED on NRP/Nautilus).
+#   * data volume size  -> ~60 days of raw data + headroom (see README sizing).
+#   * user networks/ip  -> already scoped to the pod network; tighten if needed.
+#   * apply into the SAME namespace as keeper.yaml, the secret, and the ingester.
+#
+apiVersion: "clickhouse.altinity.com/v1"
+kind: "ClickHouseInstallation"
+metadata:
+  name: xrootd
+  labels:
+    app.kubernetes.io/part-of: osdf-clickhouse
+spec:
+  defaults:
+    templates:
+      podTemplate: clickhouse-pod
+      dataVolumeClaimTemplate: data-volume
+      logVolumeClaimTemplate: log-volume
+      serviceTemplate: cluster-service
+
+  configuration:
+    # ----- Keeper (ZooKeeper-protocol) coordination -----
+    # Points at the CHK service created by keeper.yaml (same namespace).
+    zookeeper:
+      nodes:
+        - host: clickhouse-keeper
+          port: 2181
+      # Store CH's own coordination under a dedicated znode root.
+      root: /clickhouse/xrootd
+
+    # ----- Cluster topology -----
+    clusters:
+      - name: xrootd
+        layout:
+          shardsCount: 2
+          replicasCount: 2
+        templates:
+          podTemplate: clickhouse-pod
+          dataVolumeClaimTemplate: data-volume
+          logVolumeClaimTemplate: log-volume
+
+    # ----- Users -----
+    # Passwords come from the clickhouse-credentials Secret via secretKeyRef,
+    # so no credential is ever written into this CR.
+    users:
+      # Application user: the ingester INSERTs, and it can SELECT for readback.
+      ingester/password:
+        valueFrom:
+          secretKeyRef:
+            name: clickhouse-credentials
+            key: ingester-password
+      ingester/networks/ip:
+        - "::/0"           # pod network; tighten with a NetworkPolicy (networkpolicy.yaml)
+      ingester/profile: default
+      ingester/quota: default
+      ingester/grants/query:
+        - "GRANT SELECT, INSERT, OPTIMIZE, CREATE TABLE, CREATE VIEW, DROP TABLE ON xrootd.*"
+
+      # Read-only user for Grafana / analysts.
+      reader/password:
+        valueFrom:
+          secretKeyRef:
+            name: clickhouse-credentials
+            key: reader-password
+      reader/networks/ip:
+        - "::/0"
+      reader/profile: readonly
+      reader/quota: default
+      reader/grants/query:
+        - "GRANT SELECT ON xrootd.*"
+
+    # ----- Server settings -----
+    settings:
+      # Built-in Prometheus endpoint scraped by servicemonitor.yaml.
+      prometheus/endpoint: /metrics
+      prometheus/port: 9363
+      prometheus/metrics: true
+      prometheus/events: true
+      prometheus/asynchronous_metrics: true
+      prometheus/status_info: true
+      # Keep the default user locked down; real access is via ingester/reader.
+      # (The operator manages the default user for internal replication.)
+
+    profiles:
+      # A read-only profile used by the reader user.
+      readonly/readonly: 1
+      readonly/max_execution_time: 60
+      # Sensible large-query guard rails for the default (ingester) profile.
+      default/max_partitions_per_insert_block: 100
+
+    files:
+      # Nothing embedded here; schema is applied by schema/apply-job.yaml so it
+      # can be versioned and re-run independently. You *can* instead embed the
+      # SQL here under files and reference it, but a Job is easier to iterate.
+
+  templates:
+    # ----- Service (internal ClusterIP: native 9000 + HTTP 8123) -----
+    serviceTemplates:
+      - name: cluster-service
+        generateName: "clickhouse-{chi}"
+        spec:
+          type: ClusterIP           # internal to the namespace only
+          ports:
+            - name: http
+              port: 8123
+            - name: tcp
+              port: 9000
+            - name: metrics
+              port: 9363
+
+    # ----- Pod template: hardened, resourced -----
+    podTemplates:
+      - name: clickhouse-pod
+        metadata:
+          labels:
+            app.kubernetes.io/part-of: osdf-clickhouse
+        spec:
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 101
+            runAsGroup: 101
+            fsGroup: 101
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: clickhouse
+              # PINNED to the 24.8 LTS family. Pin to a digest in production
+              # (see operator/README.md "Pinning by digest").
+              image: clickhouse/clickhouse-server:24.8
+              imagePullPolicy: IfNotPresent
+              securityContext:
+                allowPrivilegeEscalation: false
+                runAsNonRoot: true
+                capabilities:
+                  drop:
+                    - ALL
+              resources:
+                requests:
+                  cpu: "2"
+                  memory: "4Gi"
+                limits:
+                  cpu: "4"
+                  memory: "8Gi"
+              ports:
+                - name: http
+                  containerPort: 8123
+                - name: tcp
+                  containerPort: 9000
+                - name: metrics
+                  containerPort: 9363
+          # Spread replicas of a shard across nodes.
+          affinity:
+            podAntiAffinity:
+              preferredDuringSchedulingIgnoredDuringExecution:
+                - weight: 100
+                  podAffinityTerm:
+                    labelSelector:
+                      matchLabels:
+                        app.kubernetes.io/part-of: osdf-clickhouse
+                    topologyKey: kubernetes.io/hostname
+
+    # ----- Persistent storage -----
+    volumeClaimTemplates:
+      - name: data-volume
+        # Retain data across pod/CHI reconciles.
+        reclaimPolicy: Retain
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          # >>> SET PER CLUSTER <<< e.g. "rook-ceph-block" on NRP/Nautilus.
+          # storageClassName: "REPLACE_ME_BLOCK_STORAGE_CLASS"
+          resources:
+            requests:
+              # >>> SIZE FOR ~60 DAYS OF RAW DATA + HEADROOM <<<
+              # This is PER REPLICA. See README "Storage sizing".
+              storage: 500Gi
+      - name: log-volume
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          # storageClassName: "REPLACE_ME_BLOCK_STORAGE_CLASS"
+          resources:
+            requests:
+              storage: 20Gi

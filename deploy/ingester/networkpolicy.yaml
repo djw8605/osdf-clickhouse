@@ -1,0 +1,51 @@
+# NetworkPolicy for the ingester: egress ONLY to RabbitMQ and ClickHouse (+DNS);
+# ingress ONLY from Prometheus (metrics).
+#
+# Requires a NetworkPolicy-enforcing CNI (Calico/Cilium on NRP/Nautilus).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: osdf-clickhouse-ingester
+  labels:
+    app.kubernetes.io/name: osdf-clickhouse-ingester
+    app.kubernetes.io/part-of: osdf-clickhouse
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: osdf-clickhouse-ingester
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Prometheus scraping the metrics port.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+      ports:
+        - { protocol: TCP, port: 9100 }
+  egress:
+    # DNS.
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    # ClickHouse (in-namespace, INSERT path).
+    - to:
+        - podSelector:
+            matchLabels:
+              clickhouse.altinity.com/chi: xrootd
+      ports:
+        - { protocol: TCP, port: 9000 }
+        - { protocol: TCP, port: 8123 }
+    # RabbitMQ broker (external OSG broker). NetworkPolicy cannot resolve DNS
+    # names, so scope by IP block.
+    # >>> SET to the broker's address range; the default allows any host on the
+    #     AMQP(S) ports, which you should tighten. <<<
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - { protocol: TCP, port: 5671 }  # AMQPS
+        - { protocol: TCP, port: 5672 }  # AMQP

@@ -1,0 +1,65 @@
+# HorizontalPodAutoscaler for the ingester.
+#
+# Default: CPU-based (works out of the box with metrics-server). CPU is a decent
+# proxy because parse + insert work scales with message rate.
+#
+# BETTER for a queue workload: scale on QUEUE DEPTH so pods spin up when the
+# broker backs up, not just when CPU is hot. Two ways to wire that:
+#
+#  1) KEDA (recommended) — see the commented ScaledObject at the bottom. KEDA's
+#     rabbitmq scaler reads queue length via the management API and scales the
+#     Deployment (it manages its own HPA under the hood). Remove THIS HPA if you
+#     use KEDA, since two autoscalers must not target one Deployment.
+#
+#  2) Prometheus adapter — expose rabbitmq_queue_messages via the RabbitMQ
+#     Prometheus plugin / exporter, register it as an external metric, and use
+#     `type: External` here. More moving parts than KEDA.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: osdf-clickhouse-ingester
+  labels:
+    app.kubernetes.io/name: osdf-clickhouse-ingester
+    app.kubernetes.io/part-of: osdf-clickhouse
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: osdf-clickhouse-ingester
+  minReplicas: 3
+  maxReplicas: 12
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+    scaleUp:
+      stabilizationWindowSeconds: 30
+---
+# --- KEDA alternative (queue-depth scaling). Requires KEDA installed. ---
+# Delete the HPA above before applying this.
+#
+# apiVersion: keda.sh/v1alpha1
+# kind: ScaledObject
+# metadata:
+#   name: osdf-clickhouse-ingester
+# spec:
+#   scaleTargetRef:
+#     name: osdf-clickhouse-ingester
+#   minReplicaCount: 3
+#   maxReplicaCount: 20
+#   triggers:
+#     - type: rabbitmq
+#       metadata:
+#         protocol: http
+#         # queueLength target per replica; total depth / this = desired replicas.
+#         mode: QueueLength
+#         value: "5000"
+#         # Scale on the busiest queue (the main stream).
+#         queueName: osdf-clickhouse-ingester.shoveled-xrd
+#         hostFromEnv: RABBITMQ_MGMT_URL   # e.g. https://user:pass@broker:15671/

@@ -1,0 +1,105 @@
+# Ingester Deployment — competing consumers (default 3 replicas).
+#
+# All replicas share one durable queue per exchange, so scaling replicas scales
+# consumption horizontally. See README "Runbook: drain / redeploy".
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: osdf-clickhouse-ingester
+  labels:
+    app.kubernetes.io/name: osdf-clickhouse-ingester
+    app.kubernetes.io/part-of: osdf-clickhouse
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: osdf-clickhouse-ingester
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: osdf-clickhouse-ingester
+        app.kubernetes.io/part-of: osdf-clickhouse
+    spec:
+      # SIGTERM triggers graceful shutdown: stop consuming, flush the in-flight
+      # batch, ack, exit. Give it room to flush before SIGKILL.
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: ingester
+          # >>> SET to your built image; PIN by tag or digest <<<
+          image: "ghcr.io/djw8605/osdf-clickhouse-ingester:0.1.0"
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+          envFrom:
+            - configMapRef:
+                name: ingester-config
+          env:
+            # Plain-mode override: present only if the Secret defines it.
+            - name: INGESTER_AMQP_URL
+              valueFrom:
+                secretKeyRef:
+                  name: ingester-secrets
+                  key: INGESTER_AMQP_URL
+                  optional: true
+          ports:
+            - name: metrics
+              containerPort: 9100
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "512Mi"
+          volumeMounts:
+            # Mounted as directories (NOT subPath) so rotated secrets propagate
+            # to the file; the ingester re-reads the token on mtime change.
+            - name: amqp-token
+              mountPath: /etc/ingester/amqp-token
+              readOnly: true
+            - name: ch-password
+              mountPath: /etc/ingester/ch
+              readOnly: true
+      volumes:
+        - name: amqp-token
+          secret:
+            secretName: ingester-secrets
+            items:
+              - key: token
+                path: token
+        - name: ch-password
+          secret:
+            secretName: ingester-secrets
+            items:
+              - key: ch-password
+                path: password

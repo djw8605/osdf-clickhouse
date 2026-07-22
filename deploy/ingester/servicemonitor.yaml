@@ -1,0 +1,20 @@
+# Prometheus ServiceMonitor for the ingester's /metrics endpoint.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: osdf-clickhouse-ingester
+  labels:
+    app.kubernetes.io/name: osdf-clickhouse-ingester
+    app.kubernetes.io/part-of: osdf-clickhouse
+    # >>> If your Prometheus selects by release label, set it here <<<
+    # release: prometheus
+spec:
+  namespaceSelector:
+    matchLabels: {}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: osdf-clickhouse-ingester
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s

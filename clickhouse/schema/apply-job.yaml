@@ -1,0 +1,87 @@
+# Schema apply Job — runs the idempotent DDL (00..03) against the cluster.
+#
+# The SQL uses ON CLUSTER '{cluster}', so connecting to ANY one node applies the
+# DDL cluster-wide (dispatched to all hosts via Keeper's DDL queue).
+#
+# STEP 1 — publish the SQL as a ConfigMap (from the files in this directory):
+#
+#   kubectl -n <namespace> create configmap clickhouse-schema \
+#       --from-file=clickhouse/schema/ \
+#       --dry-run=client -o yaml | kubectl -n <namespace> apply -f -
+#
+# STEP 2 — apply this Job:
+#
+#   kubectl -n <namespace> apply -f clickhouse/schema/apply-job.yaml
+#
+# Re-running is safe (CREATE ... IF NOT EXISTS). To re-run, delete the completed
+# Job first: kubectl -n <ns> delete job clickhouse-schema-apply
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: clickhouse-schema-apply
+  labels:
+    app.kubernetes.io/part-of: osdf-clickhouse
+spec:
+  backoffLimit: 6
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: osdf-clickhouse
+    spec:
+      restartPolicy: OnFailure
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+        runAsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: apply
+          # clickhouse-client ships in the server image; keep it pinned to the
+          # same 24.8 LTS family as the cluster.
+          image: clickhouse/clickhouse-server:24.8
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: CH_HOST
+              # Service created by the CHI serviceTemplate (generateName
+              # "clickhouse-{chi}" -> "clickhouse-xrootd").
+              value: "clickhouse-xrootd"
+            - name: CH_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: clickhouse-credentials
+                  key: ingester-password
+          command:
+            - /bin/bash
+            - -ec
+            - |
+              echo "Waiting for ClickHouse at ${CH_HOST}:9000 ..."
+              for i in $(seq 1 60); do
+                if clickhouse-client --host "${CH_HOST}" --port 9000 \
+                     --user ingester --password "${CH_PASSWORD}" \
+                     --query "SELECT 1" >/dev/null 2>&1; then
+                  echo "ClickHouse is up."; break
+                fi
+                sleep 5
+              done
+              shopt -s nullglob
+              for f in /schema/0[0-3]_*.sql; do
+                echo "==> Applying ${f}"
+                clickhouse-client --host "${CH_HOST}" --port 9000 \
+                  --user ingester --password "${CH_PASSWORD}" \
+                  --multiquery < "${f}"
+              done
+              echo "Schema applied."
+          volumeMounts:
+            - name: schema
+              mountPath: /schema
+              readOnly: true
+      volumes:
+        - name: schema
+          configMap:
+            name: clickhouse-schema

@@ -1,0 +1,83 @@
+# NetworkPolicy restricting access to the ClickHouse pods.
+#
+# Ingress to ClickHouse (native 9000 / HTTP 8123) is allowed ONLY from:
+#   * the ingester pods (competing consumers doing INSERTs),
+#   * explicitly-allowed query clients (Grafana),
+#   * other ClickHouse pods (replication / distributed queries),
+#   * Prometheus (metrics port 9363 only).
+#
+# Adjust the podSelector / namespaceSelector labels to match YOUR cluster's
+# Grafana and Prometheus deployments (the values below are common defaults).
+#
+# Requires a CNI that enforces NetworkPolicy (Calico/Cilium — both available on
+# NRP/Nautilus). Without such a CNI this manifest is a no-op.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: clickhouse-ingress
+  labels:
+    app.kubernetes.io/part-of: osdf-clickhouse
+spec:
+  podSelector:
+    matchLabels:
+      clickhouse.altinity.com/chi: xrootd
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # ClickHouse <-> ClickHouse (replication, interserver, distributed reads).
+    - from:
+        - podSelector:
+            matchLabels:
+              clickhouse.altinity.com/chi: xrootd
+      ports:
+        - { protocol: TCP, port: 9000 }
+        - { protocol: TCP, port: 9009 }  # interserver HTTP (replica fetch)
+        - { protocol: TCP, port: 8123 }
+    # Ingester -> ClickHouse (INSERT path).
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: osdf-clickhouse-ingester
+      ports:
+        - { protocol: TCP, port: 9000 }
+        - { protocol: TCP, port: 8123 }
+    # Grafana / query clients -> ClickHouse.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: grafana
+      ports:
+        - { protocol: TCP, port: 9000 }
+        - { protocol: TCP, port: 8123 }
+    # Prometheus -> ClickHouse metrics only.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+      ports:
+        - { protocol: TCP, port: 9363 }
+  egress:
+    # DNS resolution.
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    # ClickHouse <-> ClickHouse.
+    - to:
+        - podSelector:
+            matchLabels:
+              clickhouse.altinity.com/chi: xrootd
+      ports:
+        - { protocol: TCP, port: 9000 }
+        - { protocol: TCP, port: 9009 }
+        - { protocol: TCP, port: 8123 }
+    # ClickHouse -> Keeper (coordination).
+    - to:
+        - podSelector:
+            matchLabels:
+              clickhouse-keeper.altinity.com/chk: clickhouse-keeper
+      ports:
+        - { protocol: TCP, port: 2181 }  # ZK-compatible client port
+        - { protocol: TCP, port: 9234 }  # raft
