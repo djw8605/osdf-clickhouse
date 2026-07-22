@@ -25,43 +25,64 @@ Two deliverables in one repo:
 
 ## Architecture
 
-```
-                 XRootD servers (UDP monitoring packets)
-                              │
-                    xrootd-monitoring COLLECTOR
-                (correlates packets -> JSON records)
-                              │  publishes (empty routing key, text/plain)
-        ┌─────────────────────┼───────────────┬──────────────┐
-        │ fstream (CONSUMED)  │ gstream (NOT)  │ WLCG (NOT)
-        ▼                     ▼                ▼
-   shoveled-xrd        xrd-cache-events   xrd-wlcg-events
- (CollectorRecord)     xrd-tcp-events     xrd-wlcg-cache-events
-        │              xrd-tpc-events     xrd-wlcg-tpc-events
-        │
-   RabbitMQ broker (existing; OSG)   ── username/password auth
-        │   one durable queue, shared by all pods
-        ▼
-┌──────────────────────────────┐   manual ack AFTER commit
-│  Go ingester (Deployment,     │──────────────┐
-│  N competing-consumer pods)   │              │
-│  parse → batch (10k / 1s)     │              ▼
-└──────────────┬───────────────┘     RabbitMQ (ack / nack-requeue)
-               │ native batch INSERT (clickhouse-go/v2)
-               ▼
-        raw_records_dist  (Distributed, shard key = cityHash64(event_id))
-               │
-      ┌────────┴─────────┐  per shard, replicated
-      ▼                  ▼
- raw_records_local   raw_records_local        ← ReplicatedReplacingMergeTree
- (shard 1, ×2 repl)  (shard 2, ×2 repl)          60-day TTL, dedup on event_id
-      │                  │
-      │   materialized views on insert
-      ▼                  ▼
- rollup_hourly_local / rollup_daily_local     ← ReplicatedAggregatingMergeTree
-      (2-year TTL, countState/sumState/uniqState)
-               ▲
-               │ countMerge / sumMerge / uniqMerge
-        Grafana / analysts (reader user)
+```mermaid
+flowchart TB
+    subgraph edge["XRootD data source"]
+        XRD["XRootD servers<br/>UDP monitoring packets"]
+        COL["xrootd-monitoring COLLECTOR<br/>correlates packets into JSON records"]
+        XRD -->|"UDP :9993"| COL
+    end
+
+    subgraph broker["RabbitMQ broker (existing, OSG)"]
+        EXF["exchange: shoveled-xrd<br/>fstream / CollectorRecord"]
+        EXG["exchanges: xrd-cache/tcp/tpc-events<br/>gstream — NOT consumed"]
+        EXW["exchanges: xrd-wlcg-*<br/>WLCG — NOT consumed"]
+        Q["durable queue<br/>osdf-clickhouse-ingester.shoveled-xrd"]
+        EXF --> Q
+    end
+
+    COL -->|"publish: empty routing key, text/plain"| EXF
+    COL -.->|"not bound"| EXG
+    COL -.->|"not bound"| EXW
+
+    subgraph ing["Ingester — K8s Deployment (competing consumers)"]
+        direction LR
+        P1["pod 1"]
+        P2["pod 2"]
+        P3["pod N"]
+    end
+
+    Q -->|"consume, prefetch,<br/>username/password auth"| ing
+    ing -.->|"ack AFTER commit /<br/>nack-requeue on failure"| Q
+
+    subgraph chs["ClickHouse cluster (Altinity operator)"]
+        KEEP["ClickHouse Keeper<br/>3-node quorum"]
+        DIST["raw_records_dist<br/>Distributed — shard by cityHash64(event_id)"]
+        subgraph shards["shards × replicas"]
+            direction LR
+            SH1["shard 1<br/>raw_records_local ×2 replicas<br/>ReplicatedReplacingMergeTree<br/>60-day TTL, dedup on event_id"]
+            SH2["shard 2<br/>raw_records_local ×2 replicas<br/>ReplicatedReplacingMergeTree<br/>60-day TTL, dedup on event_id"]
+        end
+        RU["rollup_hourly / rollup_daily<br/>ReplicatedAggregatingMergeTree<br/>2-year TTL"]
+        DIST --> SH1
+        DIST --> SH2
+        SH1 -->|"materialized view on insert"| RU
+        SH2 -->|"materialized view on insert"| RU
+        SH1 <-.->|"replication coordination"| KEEP
+        SH2 <-.->|"replication coordination"| KEEP
+    end
+
+    ing -->|"native batch INSERT<br/>10k rows / 1s, clickhouse-go/v2"| DIST
+
+    subgraph obs["Observability & consumers"]
+        PROM["Prometheus"]
+        GRAF["Grafana / analysts<br/>reader user"]
+    end
+
+    PROM -.->|"scrape /metrics :9100"| ing
+    PROM -.->|"scrape /metrics :9363"| chs
+    GRAF -->|"countMerge / sumMerge / uniqMerge"| RU
+    GRAF -->|"ad-hoc FINAL reads"| DIST
 ```
 
 Coordination (ReplicatedMergeTree) is provided by a 3-node **ClickHouse Keeper**
