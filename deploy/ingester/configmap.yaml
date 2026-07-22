@@ -1,5 +1,5 @@
 # Non-secret ingester configuration (12-factor env vars).
-# Secrets (AMQP credentials / JWT token, ClickHouse password) live in the
+# Secrets (the AMQP URL with username/password, ClickHouse password) live in the
 # Secret, NOT here. See secret.example.yaml.
 apiVersion: v1
 kind: ConfigMap
@@ -10,16 +10,12 @@ metadata:
     app.kubernetes.io/part-of: osdf-clickhouse
 data:
   # --- RabbitMQ ---
-  # Host only; credentials are injected differently depending on auth mode:
-  #   * token mode: URL has NO userinfo; INGESTER_AMQP_TOKEN_FILE points at the
-  #     mounted JWT (username "shoveler"). See the Deployment volume mount.
-  #   * plain mode: put user:pass in INGESTER_AMQP_URL via the Secret instead.
-  # >>> SET the broker host/vhost per cluster <<<
-  INGESTER_AMQP_URL: "amqps://osg-broker.example.org:5671/%2f"
-  INGESTER_AMQP_TOKEN_FILE: "/etc/ingester/amqp-token/token"
+  # The broker URL carries username:password and lives in the Secret
+  # (INGESTER_AMQP_URL) because it contains a credential -- see secret.example.yaml.
 
-  # Non-WLCG exchanges (defaults; WLCG exchanges intentionally excluded).
-  INGESTER_EXCHANGES: "shoveled-xrd,xrd-cache-events,xrd-tcp-events,xrd-tpc-events"
+  # fstream only: the single main exchange that carries the CollectorRecord.
+  # gstream (xrd-cache/tcp/tpc) and WLCG exchanges are intentionally excluded.
+  INGESTER_EXCHANGES: "shoveled-xrd"
   # Assumed exchange type (see README "Exchange type assumption"). Passive
   # declare avoids ever redeclaring with a conflicting type.
   INGESTER_EXCHANGE_TYPE: "fanout"

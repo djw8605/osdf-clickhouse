@@ -16,9 +16,8 @@ const envPrefix = "INGESTER_"
 // Config is the fully-resolved ingester configuration.
 type Config struct {
 	// --- AMQP / RabbitMQ ---
-	AMQPURL        string   // amqp[s]://[user[:pass]@]host:port/vhost
-	AMQPTokenFile  string   // path to a JWT/token file; when set and URL has no userinfo, auth uses user "shoveler" + token
-	Exchanges      []string // non-WLCG exchanges to consume
+	AMQPURL        string   // amqps://user:password@host:port/vhost (plain username/password auth)
+	Exchanges      []string // fstream exchange(s) to consume
 	ExchangeType   string   // fanout|topic|direct|headers — used only if PassiveDeclare is false
 	PassiveDeclare bool     // if true, declare exchanges passively (never redeclare with a conflicting type)
 	BindKey        string   // routing/binding key; "" for fanout/direct, "#" for topic
@@ -50,27 +49,20 @@ type Config struct {
 	LogFormat   string // json|text
 }
 
-// The four non-WLCG exchanges confirmed from upstream config.go defaults
-// (amqp.exchange, amqp.exchange_cache, amqp.exchange_tcp, amqp.exchange_tpc).
-// The WLCG exchanges (xrd-wlcg-events, xrd-wlcg-cache-events, xrd-wlcg-tpc-events)
-// are deliberately NOT included.
+// defaultExchanges is the fstream exchange that carries the fully-structured
+// CollectorRecord (upstream config.go default amqp.exchange = "shoveled-xrd").
+//
+// The gstream exchanges (xrd-cache-events, xrd-tcp-events, xrd-tpc-events) and
+// the WLCG exchanges (xrd-wlcg-*) are deliberately NOT consumed: this ingester
+// handles fstream data only.
 var defaultExchanges = []string{
 	"shoveled-xrd",
-	"xrd-cache-events",
-	"xrd-tcp-events",
-	"xrd-tpc-events",
 }
-
-// MainExchange is the exchange that carries the fully-structured CollectorRecord.
-// Records from any other configured exchange are treated as gstream events for
-// dedup-id purposes (hashed on body identity rather than natural key).
-const MainExchange = "shoveled-xrd"
 
 // Load reads configuration from the environment and applies defaults.
 func Load() (*Config, error) {
 	c := &Config{
 		AMQPURL:        env("AMQP_URL", "amqp://guest:guest@localhost:5672/"),
-		AMQPTokenFile:  env("AMQP_TOKEN_FILE", ""),
 		Exchanges:      splitCSV(env("EXCHANGES", strings.Join(defaultExchanges, ","))),
 		ExchangeType:   env("EXCHANGE_TYPE", "fanout"),
 		PassiveDeclare: envBool("EXCHANGE_PASSIVE", true),
@@ -128,34 +120,6 @@ func Load() (*Config, error) {
 // the same name so they act as competing consumers sharing one queue.
 func (c *Config) QueueName(exchange string) string {
 	return c.QueuePrefix + "." + exchange
-}
-
-// UsesTokenAuth reports whether token-file auth should be used. It mirrors the
-// upstream shoveler rule: token auth applies when the AMQP URL carries no
-// userinfo and a token file is configured.
-func (c *Config) UsesTokenAuth() bool {
-	if c.AMQPTokenFile == "" {
-		return false
-	}
-	return !urlHasUserInfo(c.AMQPURL)
-}
-
-func urlHasUserInfo(rawURL string) bool {
-	// crude but dependency-free: look for "@" after the scheme separator.
-	i := strings.Index(rawURL, "://")
-	if i < 0 {
-		return false
-	}
-	rest := rawURL[i+3:]
-	at := strings.Index(rest, "@")
-	slash := strings.Index(rest, "/")
-	if at < 0 {
-		return false
-	}
-	if slash >= 0 && at > slash {
-		return false // '@' is in the path, not the authority
-	}
-	return true
 }
 
 func env(key, def string) string {

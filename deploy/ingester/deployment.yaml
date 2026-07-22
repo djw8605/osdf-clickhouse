@@ -50,13 +50,12 @@ spec:
             - configMapRef:
                 name: ingester-config
           env:
-            # Plain-mode override: present only if the Secret defines it.
+            # Broker URL with username:password (from the Secret).
             - name: INGESTER_AMQP_URL
               valueFrom:
                 secretKeyRef:
                   name: ingester-secrets
                   key: INGESTER_AMQP_URL
-                  optional: true
           ports:
             - name: metrics
               containerPort: 9100
@@ -82,21 +81,10 @@ spec:
               cpu: "1"
               memory: "512Mi"
           volumeMounts:
-            # Mounted as directories (NOT subPath) so rotated secrets propagate
-            # to the file; the ingester re-reads the token on mtime change.
-            - name: amqp-token
-              mountPath: /etc/ingester/amqp-token
-              readOnly: true
             - name: ch-password
               mountPath: /etc/ingester/ch
               readOnly: true
       volumes:
-        - name: amqp-token
-          secret:
-            secretName: ingester-secrets
-            items:
-              - key: token
-                path: token
         - name: ch-password
           secret:
             secretName: ingester-secrets

@@ -174,11 +174,10 @@ func (b *batcher) add(d amqpc.Delivery) {
 		b.log.Debug("json parse error; storing raw body", "exchange", d.Exchange, "error", err)
 		// rec stays zero-valued; raw_json + event_time(receive) preserve the message.
 	}
-	isMain := d.Exchange == config.MainExchange
 	row := chwriter.Row{
 		Record:         rec,
 		SourceExchange: d.Exchange,
-		EventID:        model.ComputeEventID(rec, isMain, d.Body),
+		EventID:        model.ComputeEventID(rec),
 		EventTime:      rec.EventTime(recv),
 		RawJSON:        d.Body,
 	}

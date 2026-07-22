@@ -1,6 +1,7 @@
 # osdf-clickhouse
 
-A production data pipeline that ingests the **non-WLCG** stream from the
+A production data pipeline that ingests the **fstream** (file-access) records
+from the
 [xrootd-monitoring-shoveler](https://github.com/opensciencegrid/xrootd-monitoring-shoveler)
 **collector** into a sharded + replicated **ClickHouse** cluster on Kubernetes.
 
@@ -9,9 +10,14 @@ Two deliverables in one repo:
 1. **ClickHouse on Kubernetes** — Altinity operator, a `ClickHouseInstallation`
    (2 shards × 2 replicas), a 3-node ClickHouse Keeper quorum, hardened pods,
    persistent storage, metrics, network policy, and an idempotent schema.
-2. **Go ingester** — consumes the non-WLCG RabbitMQ exchanges as competing
-   consumers and batch-inserts into ClickHouse with at-least-once semantics that
-   the schema's dedup key absorbs.
+2. **Go ingester** — consumes the fstream exchange (`shoveled-xrd`) as competing
+   consumers, authenticates with a plain username/password, and batch-inserts
+   into ClickHouse with at-least-once semantics that the schema's dedup key
+   absorbs.
+
+> **Scope:** fstream only. The gstream exchanges (`xrd-cache-events`,
+> `xrd-tcp-events`, `xrd-tpc-events`) and the WLCG exchanges (`xrd-wlcg-*`) are
+> **not** consumed.
 
 > Full requirements are in [`SPEC.md`](./SPEC.md).
 
@@ -25,16 +31,15 @@ Two deliverables in one repo:
                     xrootd-monitoring COLLECTOR
                 (correlates packets -> JSON records)
                               │  publishes (empty routing key, text/plain)
-        ┌─────────────────────┼──────────────────────────────┐
-        │ non-WLCG exchanges  │        WLCG exchanges (NOT consumed here)
-        ▼                     ▼                               ▼
-   shoveled-xrd        xrd-cache-events              xrd-wlcg-events
- (CollectorRecord)     xrd-tcp-events                xrd-wlcg-cache-events
-                       xrd-tpc-events                xrd-wlcg-tpc-events
-        │  (gstream event maps ─┘)
+        ┌─────────────────────┼───────────────┬──────────────┐
+        │ fstream (CONSUMED)  │ gstream (NOT)  │ WLCG (NOT)
+        ▼                     ▼                ▼
+   shoveled-xrd        xrd-cache-events   xrd-wlcg-events
+ (CollectorRecord)     xrd-tcp-events     xrd-wlcg-cache-events
+        │              xrd-tpc-events     xrd-wlcg-tpc-events
         │
-   RabbitMQ broker (existing; OSG)
-        │   one durable queue per exchange, shared by all pods
+   RabbitMQ broker (existing; OSG)   ── username/password auth
+        │   one durable queue, shared by all pods
         ▼
 ┌──────────────────────────────┐   manual ack AFTER commit
 │  Go ingester (Deployment,     │──────────────┐
@@ -79,46 +84,37 @@ including the accounting-relevant `serverID` / `server_hostname` / `server_ip`,
 `site`, `user` / `user_dn` / `vo`, `host`, token claims, file path fields, byte
 counters, and per-operation size stats.
 
-### The exchanges
+### The exchanges — and why we consume only fstream
 
-`config.go` defaults (confirmed): the **non-WLCG** exchanges are
-`shoveled-xrd`, `xrd-cache-events`, `xrd-tcp-events`, `xrd-tpc-events`. The
-WLCG exchanges (`xrd-wlcg-events`, `xrd-wlcg-cache-events`,
-`xrd-wlcg-tpc-events`) are produced only when the VO is `cms` or the path starts
-with `/store` or `/user/dteam`; **we do not bind them.**
+`config.go` defaults (confirmed):
+
+| Exchange           | Payload                          | Consumed here? |
+|--------------------|----------------------------------|----------------|
+| `shoveled-xrd`     | **fstream** — correlated file-close `CollectorRecord` | **Yes** |
+| `xrd-cache-events` | gstream cache event (map)        | No             |
+| `xrd-tcp-events`   | gstream TCP event (map)          | No             |
+| `xrd-tpc-events`   | gstream TPC event (map)          | No             |
+| `xrd-wlcg-*`       | WLCG-converted records           | No             |
+
+Only `shoveled-xrd` carries the structured `CollectorRecord`. The gstream
+exchanges carry heterogeneous event maps (`map[string]interface{}` with fields
+like `file_path`, `block_size`, `source`, `destination`, …) produced by
+`emitGStreamEvent` in `cmd/collector/main.go`; the WLCG exchanges only receive
+records when the VO is `cms` or the path starts with `/store` or `/user/dteam`.
+
+**This ingester consumes fstream only** — a deliberate scope choice. All typed
+columns are derived from `CollectorRecord`, so a single wide schema fits the one
+stream exactly. `INGESTER_EXCHANGES` is still a comma-separated list, so more
+exchanges *could* be added later, but the default (and intent) is `shoveled-xrd`
+alone. A `source_exchange` column records provenance, and a **`raw_json` column
+preserves the exact original body** so nothing is lost if the upstream struct
+evolves (recover fields with `JSONExtract*`).
 
 ### Publisher behavior
 
 `amqp.go` publishes with `channel.Publish(exchange, "" /*routing key*/, false,
 false, {ContentType: "text/plain", Body: json})`. Empty routing key, no
 self-declaration of the exchange (exchanges are pre-provisioned on the broker).
-
-### ⚠️ The four non-WLCG exchanges do NOT share one schema
-
-This is the most important finding and shapes the schema design:
-
-| Exchange           | Payload                          | Matches `CollectorRecord`? |
-|--------------------|----------------------------------|----------------------------|
-| `shoveled-xrd`     | Correlated file-close record     | **Yes** (full struct)      |
-| `xrd-cache-events` | gstream **cache** event (map)    | No — different fields      |
-| `xrd-tcp-events`   | gstream **TCP** event (map)      | No — different fields      |
-| `xrd-tpc-events`   | gstream **TPC** event (map)      | No — different fields      |
-
-Only `shoveled-xrd` carries the structured `CollectorRecord`. The type-specific
-exchanges carry heterogeneous "gstream" event maps (`map[string]interface{}`
-with fields like `file_path`, `block_size`, `access_count`, `source`,
-`destination`, …) produced by `emitGStreamEvent` in `cmd/collector/main.go`.
-
-**How the design handles this:**
-
-- Typed columns are derived from `CollectorRecord` (the main stream). When a
-  gstream event is parsed into that struct, only overlapping JSON keys populate
-  (e.g. `serverID`); the rest stay zero-valued.
-- A `source_exchange` column records which exchange produced each row, so
-  queries can separate the streams.
-- The **`raw_json` column preserves the exact original body** for every row, so
-  no gstream field is ever lost. Recover them with `JSONExtract*`
-  (see example 6 in [`04_read_examples.sql`](./clickhouse/schema/04_read_examples.sql)).
 
 ### Exchange-type assumption (stated blocker)
 
@@ -137,10 +133,9 @@ routing key + the OSG collector fan-out pattern strongly implies **fanout**.
 
 ### Auth
 
-`amqp.go` uses token-file auth: when the URL has no userinfo it reads a token
-file, authenticates as username **`shoveler`** with the trimmed file contents as
-password, and re-reads on mtime change (10s ticker). The ingester mirrors this
-exactly and also supports plain `user:pass@` in the URL. See
+The ingester authenticates with a plain **username/password** embedded in the
+AMQP URL (`amqps://user:password@host:port/vhost`). The URL is supplied via the
+`INGESTER_AMQP_URL` key of the ingester Secret. See
 [Ingester configuration](#ingester-configuration).
 
 ---
@@ -173,7 +168,7 @@ exactly and also supports plain `user:pass@` in the URL. See
 │   │   ├── config/                 # 12-factor env config
 │   │   ├── model/                  # CollectorRecord + dedup-id (+ tests)
 │   │   ├── metrics/                # Prometheus collectors
-│   │   ├── amqp/                   # resilient consumer, token auth
+│   │   ├── amqp/                   # resilient consumer, username/password auth
 │   │   ├── chwriter/               # ClickHouse batch writer
 │   │   └── health/                 # /healthz /readyz /metrics
 │   ├── test/                       # testcontainers integration test (build tag)
@@ -218,7 +213,7 @@ kubectl create namespace "$NS" || true
 | **Data PVC size** (~60 days + headroom) | `clickhouse-installation.yaml` `data-volume` |
 | **Namespace**               | all `kubectl -n $NS` applies                      |
 | **Broker URL / vhost**      | `deploy/ingester/configmap.yaml`                  |
-| **Broker token or creds**   | `deploy/ingester/secret.yaml`                     |
+| **Broker URL + credentials**| `deploy/ingester/secret.yaml` (`INGESTER_AMQP_URL`)|
 | **ClickHouse passwords**    | `clickhouse/secret.yaml`, `deploy/ingester/secret.yaml` |
 | **Resource sizing**         | CHI pod template + ingester Deployment            |
 | **Prometheus release label**| `*/servicemonitor.yaml` (if your Prom selects by it)|
@@ -266,7 +261,7 @@ make docker-push IMAGE=<your-registry>/osdf-clickhouse-ingester TAG=0.1.0
 # set the image in deploy/ingester/deployment.yaml
 
 kubectl -n $NS apply -f deploy/ingester/configmap.yaml
-cp deploy/ingester/secret.example.yaml deploy/ingester/secret.yaml   # edit token + ch-password
+cp deploy/ingester/secret.example.yaml deploy/ingester/secret.yaml   # edit AMQP URL + ch-password
 kubectl -n $NS apply -f deploy/ingester/secret.yaml
 kubectl -n $NS apply -f deploy/ingester/service.yaml
 kubectl -n $NS apply -f deploy/ingester/servicemonitor.yaml
@@ -283,9 +278,8 @@ All via environment variables (prefix `INGESTER_`). Defaults in **bold**.
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `INGESTER_AMQP_URL` | `amqp://guest:guest@localhost:5672/` | Broker URL. No userinfo + token file ⇒ token auth. |
-| `INGESTER_AMQP_TOKEN_FILE` | *(empty)* | Path to JWT/token file. User `shoveler`; re-read on mtime change. |
-| `INGESTER_EXCHANGES` | **`shoveled-xrd,xrd-cache-events,xrd-tcp-events,xrd-tpc-events`** | Comma-separated non-WLCG exchanges. |
+| `INGESTER_AMQP_URL` | `amqp://guest:guest@localhost:5672/` | Broker URL **with** `user:password`. Supply via the Secret. |
+| `INGESTER_EXCHANGES` | **`shoveled-xrd`** | Comma-separated exchanges (fstream only by default). |
 | `INGESTER_EXCHANGE_TYPE` | **`fanout`** | Type used for (passive) declare. |
 | `INGESTER_EXCHANGE_PASSIVE` | **`true`** | Passive declare — never redeclare with a conflicting type. |
 | `INGESTER_BIND_KEY` | **`""`** | Binding key. `""` for fanout/direct, `#` for topic. |
@@ -319,28 +313,21 @@ correctness of dedup over that hop; with 10k-row batches the hop is negligible.
 ### Deterministic `event_id`
 
 RabbitMQ is at-least-once, and `CollectorRecord` has no stable unique id, so the
-ingester computes one (`internal/model/record.go`):
-
-- **Main stream** (`shoveled-xrd`): SHA-256 (first 128 bits, hex) over the
-  natural key — `serverID`, `server`, `filename`, `logical_dirname`,
-  `start_time`, `end_time`, `filesize`, and the byte counters. A redelivery
-  reproduces these exactly ⇒ same id ⇒ collapsed by `ReplacingMergeTree`.
-- **gstream streams** (cache/tcp/tpc): the natural-key fields are empty, so the
-  id is a hash of the **exact body bytes** — identical redeliveries dedup,
-  distinct events don't collide.
+ingester computes one (`internal/model/record.go`): SHA-256 (first 128 bits,
+hex) over the natural key — `serverID`, `server`, `filename`,
+`logical_dirname`, `start_time`, `end_time`, `filesize`, and the byte counters.
+A redelivery reproduces these exactly ⇒ same id ⇒ collapsed by
+`ReplacingMergeTree`. Because the id is derived from struct fields (not raw
+bytes), two byte-different JSON encodings of the same record still dedup.
 
 `event_id` is part of `ORDER BY (server_hostname, event_time, event_id)`, and the
 `ingest_time` version column makes the latest-inserted copy win.
 
 **Failure modes (accepted):**
 
-- *Main stream:* two genuinely distinct events sharing every hashed field would
-  collapse to one row. `serverID+filename+start+end+bytes` is unique per file
-  close in practice, so this is vanishingly unlikely.
-- *gstream:* if the collector re-emits a semantically identical event with any
-  byte-level difference (map-key ordering, added field), the two bodies hash
-  differently and **both are kept**. This favors completeness over aggressive
-  dedup — the safe direction for accounting.
+- Two genuinely distinct events sharing every hashed field would collapse to one
+  row. `serverID+filename+start+end+bytes` is unique per file close in practice,
+  so this is vanishingly unlikely.
 - *Dedup is eventual:* `ReplacingMergeTree` collapses on background merge. For
   exact counts on small/recent ranges use `FINAL` (expensive) or, better, read
   the **rollups**, which sum idempotent states.

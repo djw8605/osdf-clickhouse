@@ -1,5 +1,5 @@
-// Package amqp implements a resilient RabbitMQ consumer for the non-WLCG
-// collector exchanges. It uses the maintained github.com/rabbitmq/amqp091-go
+// Package amqp implements a resilient RabbitMQ consumer for the fstream
+// collector exchange. It uses the maintained github.com/rabbitmq/amqp091-go
 // fork (not the deprecated streadway/amqp used upstream).
 //
 // Design:
@@ -10,17 +10,14 @@
 //   - Deliveries from every queue are fanned into a single stable output
 //     channel that survives reconnects.
 //   - Manual ack: the batcher acks only after ClickHouse commits.
-//   - Reconnect with exponential backoff for connection loss, plus token-file
-//     mtime watching that forces a reconnect with fresh credentials (mirrors
-//     the upstream shoveler's CheckTokenFile behavior).
+//   - Reconnect with exponential backoff for connection loss.
+//   - Authentication is plain username/password carried in the AMQP URL.
 package amqp
 
 import (
 	"context"
 	"fmt"
 	"log/slog"
-	"net/url"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -55,9 +52,6 @@ type Consumer struct {
 	metrics *metrics.Metrics
 
 	out chan Delivery
-
-	mu           sync.Mutex
-	tokenModTime time.Time
 }
 
 // New constructs a Consumer. Call Run to start it.
@@ -106,14 +100,9 @@ func (c *Consumer) Run(ctx context.Context) {
 }
 
 // session runs one connection lifetime: dial, declare, consume, and block until
-// the connection drops, the token file changes, or ctx is cancelled.
+// the connection drops or ctx is cancelled.
 func (c *Consumer) session(ctx context.Context) error {
-	dialURL, err := c.resolveURL()
-	if err != nil {
-		return fmt.Errorf("resolving amqp url: %w", err)
-	}
-
-	conn, err := amqp.DialConfig(dialURL, amqp.Config{
+	conn, err := amqp.DialConfig(c.cfg.AMQPURL, amqp.Config{
 		Heartbeat: 10 * time.Second,
 		Properties: amqp.Table{
 			"connection_name": "osdf-clickhouse-ingester",
@@ -166,7 +155,6 @@ func (c *Consumer) session(ctx context.Context) error {
 	}
 
 	closeCh := conn.NotifyClose(make(chan *amqp.Error, 1))
-	tokenChanged := c.watchToken(sessionCtx)
 
 	select {
 	case <-ctx.Done():
@@ -180,10 +168,6 @@ func (c *Consumer) session(ctx context.Context) error {
 			return fmt.Errorf("connection closed: %w", err)
 		}
 		return fmt.Errorf("connection closed")
-	case <-tokenChanged:
-		cancel()
-		wg.Wait()
-		return fmt.Errorf("token file changed, reconnecting with new credentials")
 	}
 }
 
@@ -249,74 +233,4 @@ func (c *Consumer) forward(ctx context.Context, exchange string, in <-chan amqp.
 			}
 		}
 	}
-}
-
-// resolveURL builds the dial URL, injecting token-file credentials when in
-// token-auth mode (username "shoveler", password = trimmed token file). It also
-// records the token file mtime for change detection.
-func (c *Consumer) resolveURL() (string, error) {
-	if !c.cfg.UsesTokenAuth() {
-		return c.cfg.AMQPURL, nil
-	}
-	token, modTime, err := readToken(c.cfg.AMQPTokenFile)
-	if err != nil {
-		return "", err
-	}
-	c.mu.Lock()
-	c.tokenModTime = modTime
-	c.mu.Unlock()
-
-	u, err := url.Parse(c.cfg.AMQPURL)
-	if err != nil {
-		return "", fmt.Errorf("parsing AMQP_URL: %w", err)
-	}
-	u.User = url.UserPassword("shoveler", token)
-	return u.String(), nil
-}
-
-// watchToken returns a channel that fires once when the token file mtime
-// advances past the value captured at connect time. When not in token mode it
-// returns a channel that never fires.
-func (c *Consumer) watchToken(ctx context.Context) <-chan struct{} {
-	fired := make(chan struct{})
-	if !c.cfg.UsesTokenAuth() {
-		return fired
-	}
-	go func() {
-		ticker := time.NewTicker(10 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				st, err := os.Stat(c.cfg.AMQPTokenFile)
-				if err != nil {
-					c.log.Warn("cannot stat token file", "path", c.cfg.AMQPTokenFile, "error", err)
-					continue
-				}
-				c.mu.Lock()
-				changed := st.ModTime().After(c.tokenModTime)
-				c.mu.Unlock()
-				if changed {
-					c.log.Info("token file updated, will reconnect")
-					close(fired)
-					return
-				}
-			}
-		}
-	}()
-	return fired
-}
-
-func readToken(path string) (string, time.Time, error) {
-	st, err := os.Stat(path)
-	if err != nil {
-		return "", time.Time{}, fmt.Errorf("stat token file: %w", err)
-	}
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return "", time.Time{}, fmt.Errorf("read token file: %w", err)
-	}
-	return strings.TrimSpace(string(b)), st.ModTime(), nil
 }

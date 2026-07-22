@@ -75,11 +75,10 @@ func collectAndInsert(t *testing.T, ctx context.Context, cfg *config.Config, w *
 		case d := <-in:
 			rec := &model.CollectorRecord{}
 			_ = json.Unmarshal(d.Body, rec)
-			isMain := d.Exchange == config.MainExchange
 			rows = append(rows, chwriter.Row{
 				Record:         rec,
 				SourceExchange: d.Exchange,
-				EventID:        model.ComputeEventID(rec, isMain, d.Body),
+				EventID:        model.ComputeEventID(rec),
 				EventTime:      rec.EventTime(time.Now().UTC()),
 				RawJSON:        d.Body,
 			})

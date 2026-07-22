@@ -81,9 +81,8 @@ func TestComputeEventIDDeterministic(t *testing.T) {
 	var rec CollectorRecord
 	require.NoError(t, json.Unmarshal([]byte(sampleMain), &rec))
 
-	body := []byte(sampleMain)
-	id1 := ComputeEventID(&rec, true, body)
-	id2 := ComputeEventID(&rec, true, body)
+	id1 := ComputeEventID(&rec)
+	id2 := ComputeEventID(&rec)
 	assert.Equal(t, id1, id2, "same record must yield same id (redelivery dedup)")
 	assert.Len(t, id1, 32, "id is 128-bit hex (32 chars)")
 }
@@ -93,44 +92,28 @@ func TestComputeEventIDDistinctForDifferentRecords(t *testing.T) {
 	other := base
 	other.Read = 11 // different byte counter -> different natural key
 
-	idBase := ComputeEventID(&base, true, nil)
-	idOther := ComputeEventID(&other, true, nil)
+	idBase := ComputeEventID(&base)
+	idOther := ComputeEventID(&other)
 	assert.NotEqual(t, idBase, idOther)
 }
 
-func TestComputeEventIDMainIgnoresBody(t *testing.T) {
-	// For main-stream records the id is derived from the struct fields, not the
-	// raw bytes, so two byte-different encodings of the same record dedup.
-	rec := CollectorRecord{ServerID: "s1", Filename: "/a", StartTime: 1, EndTime: 2}
-	id1 := ComputeEventID(&rec, true, []byte(`{"a":1}`))
-	id2 := ComputeEventID(&rec, true, []byte(`{"b":2}`))
-	assert.Equal(t, id1, id2)
+func TestComputeEventIDIgnoresEncoding(t *testing.T) {
+	// The id is derived from struct fields, not raw bytes, so two byte-different
+	// JSON encodings of the same record dedup to one row.
+	a := `{"serverID":"s1","filename":"/a","start_time":1,"end_time":2}`
+	b := `{"filename":"/a","serverID":"s1","end_time":2,"start_time":1}`
+	var ra, rb CollectorRecord
+	require.NoError(t, json.Unmarshal([]byte(a), &ra))
+	require.NoError(t, json.Unmarshal([]byte(b), &rb))
+	assert.Equal(t, ComputeEventID(&ra), ComputeEventID(&rb))
 }
 
-func TestComputeEventIDGstreamUsesBody(t *testing.T) {
-	// gstream events have empty natural-key fields, so the id must come from the
-	// body. Identical bodies dedup; different bodies do not collide.
-	empty := CollectorRecord{}
-	bodyA := []byte(`{"file_path":"/cache/x","access_count":3}`)
-	bodyB := []byte(`{"file_path":"/cache/y","access_count":9}`)
-
-	idA1 := ComputeEventID(&empty, false, bodyA)
-	idA2 := ComputeEventID(&empty, false, bodyA)
-	idB := ComputeEventID(&empty, false, bodyB)
-
-	assert.Equal(t, idA1, idA2, "identical gstream bodies must dedup")
-	assert.NotEqual(t, idA1, idB, "distinct gstream bodies must not collide")
-}
-
-// A gstream cache event carries a different shape; parsing into CollectorRecord
-// must not error and must leave the struct mostly zero-valued while raw body is
-// preserved by the caller.
-func TestParseGstreamEventDoesNotError(t *testing.T) {
-	body := `{"file_path":"/cache/data.root","block_size":131072,"access_count":7,"serverID":"srv"}`
+// Unknown / evolved JSON fields must not fail parsing; overlapping keys are
+// captured and the raw body is preserved by the caller for anything unmodeled.
+func TestParseIgnoresUnknownFields(t *testing.T) {
+	body := `{"filename":"/data/x.root","serverID":"srv","some_future_field":123}`
 	var rec CollectorRecord
 	require.NoError(t, json.Unmarshal([]byte(body), &rec))
-	// Overlapping field is captured; non-overlapping cache fields are ignored.
 	assert.Equal(t, "srv", rec.ServerID)
-	assert.Equal(t, "", rec.Filename)
-	assert.Equal(t, int64(0), rec.Read)
+	assert.Equal(t, "/data/x.root", rec.Filename)
 }

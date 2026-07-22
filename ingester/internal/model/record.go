@@ -105,7 +105,7 @@ func (r *CollectorRecord) EventTime(fallback time.Time) time.Time {
 	return fallback
 }
 
-// ComputeEventID derives a deterministic, stable dedup id for the record.
+// ComputeEventID derives a deterministic, stable dedup id for a fstream record.
 //
 // RabbitMQ delivery is at-least-once, so the same logical record can be
 // delivered more than once (e.g. after a consumer crash before ack, or a
@@ -113,43 +113,28 @@ func (r *CollectorRecord) EventTime(fallback time.Time) time.Time {
 // key, and event_id is part of that key, so identical redeliveries must map to
 // the same id while genuinely distinct records must not collide.
 //
-// Strategy:
-//   - For main-stream CollectorRecords (isMain == true) the id is a hash over
-//     the natural key of a file-access record: server identity + filename +
-//     start/end time + byte counters. These fields together uniquely identify
-//     one file-close event; a redelivery reproduces them exactly.
-//   - For gstream events (cache/tcp/tpc) the CollectorRecord natural-key fields
-//     are mostly empty, so hashing them would collapse unrelated events. There
-//     we hash the exact original body bytes instead: identical redeliveries
-//     share bytes (deduped), distinct events differ (preserved).
+// The id is a hash over the natural key of a file-access record: server
+// identity + filename + start/end time + byte counters. These fields together
+// uniquely identify one file-close event; a redelivery reproduces them exactly.
 //
-// Failure modes (documented in the README):
-//   - Two genuinely distinct main-stream events that share every hashed field
-//     would collapse into one row. In practice serverID+filename+start+end+
-//     bytes is unique per file close, so this is vanishingly unlikely.
-//   - For gstream events, if the collector re-emits a semantically identical
-//     event with a byte-level difference (map key ordering, added field), the
-//     two bodies hash differently and both are kept. This favors completeness
-//     over aggressive dedup, which is the safe direction for accounting.
-func ComputeEventID(r *CollectorRecord, isMain bool, rawBody []byte) string {
+// Failure mode (documented in the README): two genuinely distinct events that
+// share every hashed field would collapse into one row. In practice
+// serverID+filename+start+end+bytes is unique per file close, so this is
+// vanishingly unlikely.
+func ComputeEventID(r *CollectorRecord) string {
 	h := sha256.New()
-	if isMain {
-		writeString(h, r.ServerID)
-		writeString(h, r.Server)
-		writeString(h, r.Filename)
-		writeString(h, r.LogicalDirname)
-		writeInt(h, r.StartTime)
-		writeInt(h, r.EndTime)
-		writeInt(h, r.Filesize)
-		writeInt(h, r.Read)
-		writeInt(h, r.Readv)
-		writeInt(h, r.Write)
-		writeInt(h, r.ReadBytesAtClose)
-		writeInt(h, r.WriteBytesAtClose)
-	} else {
-		// gstream event: dedup on exact body identity.
-		h.Write(rawBody)
-	}
+	writeString(h, r.ServerID)
+	writeString(h, r.Server)
+	writeString(h, r.Filename)
+	writeString(h, r.LogicalDirname)
+	writeInt(h, r.StartTime)
+	writeInt(h, r.EndTime)
+	writeInt(h, r.Filesize)
+	writeInt(h, r.Read)
+	writeInt(h, r.Readv)
+	writeInt(h, r.Write)
+	writeInt(h, r.ReadBytesAtClose)
+	writeInt(h, r.WriteBytesAtClose)
 	sum := h.Sum(nil)
 	// 128 bits of SHA-256 is more than enough to make collisions negligible
 	// while keeping the key column narrow.
